@@ -56,6 +56,8 @@ go test ./...
 ```caddyfile
 {
 	servers :443 {
+		# HTTP/3 must be turned off too -- see "Turn off HTTP/3 as well" below
+		protocols h1 h2
 		listener_wrappers {
 			http_drop
 			sni_whitelist {
@@ -83,6 +85,42 @@ wildcard like `*.example.com` matches `a.example.com` but not
 A connection whose ClientHello carries **no SNI at all** matches nothing, so it
 is rejected as well.
 
+### Turn off HTTP/3 as well
+
+```caddyfile
+servers :443 {
+	protocols h1 h2
+}
+```
+
+`sni_whitelist` works on `net.Listener`, i.e. on TCP. HTTP/3 runs over
+QUIC/UDP, which Caddy hands to quic-go through a `net.PacketConn`, so the
+wrapper never sees those datagrams. Two things follow, and they are the reason
+`protocols h1 h2` belongs in the example above:
+
+1. **The QUIC path cannot be silenced, only answered.** To make the same
+   decision on UDP, the plugin would have to peel the QUIC Initial packets
+   itself — the Initial keys are derived from the client's DCID, so it would
+   need `HKDF-Expand-Label` + AES-GCM + header-protection removal — reassemble
+   the ClientHello out of the CRYPTO frames (it routinely spans several
+   datagrams), and then drop them. Without that, an unknown SNI over QUIC is
+   answered by quic-go with a `CONNECTION_CLOSE`: a ~89-byte Initial packet
+   whose error code is `0x100 + TLS alert`, i.e. the same signal as the TCP
+   alert this plugin exists to suppress, just moved to UDP. The port keeps
+   answering probes.
+
+2. **Without `protocols h1 h2`, Caddy advertises HTTP/3 to your clients.**
+   Whenever the h3 server exists, every HTTP/1.1 and HTTP/2 response carries an
+   `Alt-Svc: h3=":443"` header, and browsers act on it: they switch to QUIC on
+   the next connection. The header therefore routes real traffic onto the one
+   path this plugin cannot filter, keeping a second, answering endpoint alive
+   next to the silent TCP one.
+
+Turning HTTP/3 off fixes both at once: Caddy never creates the UDP socket at
+all, and no `Alt-Svc` header is emitted. A QUIC probe then gets no reply of any
+kind — the UDP port looks like nothing is listening on it — and legitimate
+clients only ever talk to the TCP port you have private control over.
+
 ## How it works
 
 `sni_whitelist` reads from the raw TCP connection only until it has parsed the
@@ -105,11 +143,11 @@ response is written.
 
 ## Caveats
 
-- **HTTP/3 is not covered.** QUIC runs over UDP and does not go through
-  `net.Listener`, so `listener_wrappers` never see it. An unknown SNI on QUIC
-  still fails the handshake (the certificate lookup fails), just not silently.
-  Disable HTTP/3 with `protocols h1 h2` if you need identical behaviour, or add
-  a `caddy.packetconns` wrapper.
+- **HTTP/3 is not covered — turn it off.** QUIC runs over UDP and does not go
+  through `net.Listener`, so `listener_wrappers` never see it. Use
+  `protocols h1 h2` as shown in [Usage](#usage), which also stops Caddy from
+  advertising h3 via `Alt-Svc`. See
+  [Turn off HTTP/3 as well](#turn-off-http3-as-well) for the details.
 - **ECH** encrypts the SNI; only the outer (cover) name is visible, so the
   decision is made on that.
 - **The whitelist is a second place to maintain your names.** It must be kept
