@@ -70,11 +70,6 @@ type SNIWhitelistListenerWrapper struct {
 	allowed []string
 }
 
-// resetConn reports whether rejected connections should be reset.
-func (h *SNIWhitelistListenerWrapper) resetConn() bool {
-	return h.Reset == nil || *h.Reset
-}
-
 func (SNIWhitelistListenerWrapper) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "caddy.listeners.sni_whitelist",
@@ -138,7 +133,7 @@ func (h *SNIWhitelistListenerWrapper) WrapListener(l net.Listener) net.Listener 
 		// Provision should always have run; be defensive anyway.
 		allowed = normalizeServerNames(h.AllowedSNIs)
 	}
-	return &sniWhitelistListener{Listener: l, allowed: allowed, reset: h.resetConn()}
+	return &sniWhitelistListener{Listener: l, allowed: allowed, reset: shouldReset(h.Reset)}
 }
 
 // sniWhitelistListener drops TLS connections whose SNI is not allowed.
@@ -188,13 +183,7 @@ func (c *sniWhitelistConn) Read(p []byte) (int, error) {
 		c.pre = pre
 
 		if decided && !c.l.allows(sni) {
-			if c.l.reset {
-				if tc := unwrapTCPConn(c.Conn); tc != nil {
-					// linger 0 makes Close send a RST instead of a FIN
-					_ = tc.SetLinger(0)
-				}
-			}
-			_ = c.Conn.Close()
+			dropConn(c.Conn, c.l.reset)
 
 			return 0, errSNINotAllowed
 		}

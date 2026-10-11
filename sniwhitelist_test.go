@@ -294,8 +294,8 @@ func TestSNIWhitelistListenerWrapperUnmarshalCaddyfile(t *testing.T) {
 			t.Errorf("Test %d (%s): unexpected error: %v", i, tc.name, err)
 			continue
 		}
-		if h.resetConn() != tc.want.resetConn() {
-			t.Errorf("Test %d (%s): expected reset=%v, got %v", i, tc.name, tc.want.resetConn(), h.resetConn())
+		if shouldReset(h.Reset) != shouldReset(tc.want.Reset) {
+			t.Errorf("Test %d (%s): expected reset=%v, got %v", i, tc.name, shouldReset(tc.want.Reset), shouldReset(h.Reset))
 		}
 		if len(h.AllowedSNIs) != len(tc.want.AllowedSNIs) {
 			t.Errorf("Test %d (%s): expected names %q, got %q", i, tc.name, tc.want.AllowedSNIs, h.AllowedSNIs)
@@ -326,11 +326,11 @@ func TestSNIWhitelistListenerWrapperProvision(t *testing.T) {
 	}
 
 	// reset is the default connection mode
-	if !new(SNIWhitelistListenerWrapper).resetConn() {
+	if !shouldReset(nil) {
 		t.Error("expected reset to be the default connection mode")
 	}
 	fin := false
-	if (&SNIWhitelistListenerWrapper{Reset: &fin}).resetConn() {
+	if shouldReset(&fin) {
 		t.Error("expected fin to be honored when configured")
 	}
 }

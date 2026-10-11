@@ -2,10 +2,14 @@
 
 Two [Caddy](https://caddyserver.com) **listener wrappers** that keep a TLS port from answering probes. Both are [out-of-tree Caddy modules](https://caddyserver.com/docs/extending-caddy): no fork of Caddy is required.
 
+> **This project is AI-generated.** It was written with heavy AI assistance and
+> has not been battle-tested. It sits directly in front of your TLS listener, so
+> read it before you depend on it — see [AI disclosure](#ai-disclosure).
+
 | Caddyfile directive | Module ID | Effect |
 | --- | --- | --- |
+| `drop_non_tls` | `caddy.listeners.drop_non_tls` | Closes connections that do not begin with a TLS ClientHello, without writing anything. This is the broad one: plaintext HTTP, the h2c connection preface, legacy SSLv2-style hellos, port scans, random bytes. |
 | `sni_whitelist` | `caddy.listeners.sni_whitelist` | Reads the SNI out of the ClientHello **before `crypto/tls` ever sees it**. If the name is not in the whitelist, the connection is torn down without writing a single byte. |
-| `http_drop` | `caddy.listeners.http_drop` | Plaintext HTTP sent to a TLS port is disconnected with no response. |
 
 Both wrappers must be placed **before** the `tls` listener wrapper, so that they see the raw bytes of the connection.
 
@@ -27,8 +31,10 @@ With these wrappers installed, both cases produce **nothing at all**:
 | Situation | Default Caddy | With this plugin |
 | --- | --- | --- |
 | plaintext HTTP → TLS port | `400 Bad Request` + body | 0 bytes, connection closed |
+| h2c preface, SSLv2-style hello, scan garbage | varies (a fatal alert for some shapes, silence for others) | 0 bytes, connection closed |
 | SNI not in the whitelist | `alert(2, 80)` | 0 bytes, connection closed (TCP RST by default) |
 | SNI is whitelisted | works | works, unchanged |
+| connected, then says nothing | held open until the client or the OS gives up | closed by `timeouts`, see below |
 
 ## Install
 
@@ -58,8 +64,14 @@ go test ./...
 	servers :443 {
 		# HTTP/3 must be turned off too -- see "Turn off HTTP/3 as well" below
 		protocols h1 h2
+		# bound how long a connection may sit there saying nothing; the
+		# wrappers below read inside the TLS handshake window, whose deadline
+		# is min(ReadHeaderTimeout, ReadTimeout, WriteTimeout)
+		timeouts {
+			read_header 10s
+		}
 		listener_wrappers {
-			http_drop
+			drop_non_tls
 			sni_whitelist {
 				example.com
 				router.example.org
@@ -71,11 +83,16 @@ go test ./...
 }
 ```
 
-`http_drop` takes no arguments. `sni_whitelist` takes an optional first
-argument selecting how a rejected connection is torn down:
+`drop_non_tls` and `sni_whitelist` both take an optional first argument
+selecting how a rejected connection is torn down:
 
 - `reset` — close with a TCP RST (**default**, also when the argument is omitted)
 - `fin` — close gracefully with a TCP FIN
+
+`drop_non_tls` inspects only the first six bytes of a connection, so it is
+harmless to leave in front of `sni_whitelist`: it exists so that non-TLS
+traffic never reaches `crypto/tls` at all. `sni_whitelist` then takes an
+optional block of allowed server names, one per line.
 
 Every name in the block is one allowed server name, one per line. Names are
 compared case-insensitively, a trailing dot is ignored, and a left-most label
@@ -136,10 +153,26 @@ larger than the inspection limit (16 KiB + 5 bytes) — is passed through
 unchanged, so the TLS stack remains the backstop and no legitimate client is
 filtered out by accident.
 
-`http_drop` does the same thing for the first five bytes of a connection: if
-they look like an HTTP request line (`GET /`, `HEAD `, `POST `, `PUT /`,
-`OPTIO`) on a listener dedicated to TLS, the connection is closed and no
-response is written.
+`drop_non_tls` needs only the first six bytes: the record header (content type
+must be handshake `0x16`, the record-layer major version must be `0x03` — SSL
+3.0 through TLS 1.3 all use `0x03` there — and the record length must fit
+inside a TLS record and be long enough to hold a handshake header), and then
+the handshake message type, which must be ClientHello (`0x01`): the only
+message a client is allowed to send first. Anything else cannot be the start of
+a TLS client, so the connection is closed — before `crypto/tls` gets a chance to
+answer with an alert, which is what it does for some of those shapes (SSLv2-style
+hello → alert 70, oversized record → alert 22, non-ClientHello handshake message
+→ alert 50).
+
+Nothing else is parsed, and a connection that passes is handed on untouched, so
+a real client cannot be affected. Deliberately, a ClientHello-typed message with
+a malformed body still reaches the TLS stack — this is a cheap "is this a TLS
+client" filter, not a TLS validator.
+
+Plaintext HTTP needs no special case: a request line always starts with an
+ASCII method name, so it can never begin with `0x16`, and the connection is
+closed before Go's `net/http` can write its
+`400 Client sent an HTTP request to an HTTPS server.`
 
 ## Caveats
 
@@ -152,12 +185,33 @@ response is written.
   decision is made on that.
 - **The whitelist is a second place to maintain your names.** It must be kept
   in sync with the site addresses that Caddy actually manages certificates for.
-- **Timeouts still matter.** The inspection happens inside the TLS handshake
-  window, which `net/http` bounds by `min(ReadHeaderTimeout, ReadTimeout,
-  WriteTimeout)`. If none of those is set, a client that sends half a
-  ClientHello can hold the connection open. Configure
-  `servers :443 { timeouts { read_header 10s } }` if that matters to you.
+- **Timeouts still matter.** The wrappers read inside the TLS handshake window,
+  which `net/http` bounds by `min(ReadHeaderTimeout, ReadTimeout, WriteTimeout)`.
+  If none of those is set a client that connects and says nothing (or sends half
+  a ClientHello) holds the connection open indefinitely, one goroutine and one
+  file descriptor each. The example in [Usage](#usage) sets
+  `timeouts { read_header 10s }` for this reason.
 - Wrappers are HTTP/app-level; they do not affect Caddy's admin endpoint.
+
+## AI disclosure
+
+This project is written with heavy AI assistance, not by hand. The whole
+implementation — both listener wrappers, their tests and this document — was
+produced with **DeepSeek V4.1 Flash** running in **OpenCode**, driven by a human
+operator who set the requirements, made the design decisions (what gets dropped,
+alert vs. RST, the HTTP/3 trade-off), reviewed the diffs, and ran the
+packet-level tests behind the tables above.
+
+What that means if you are thinking of using it:
+
+- It is security-adjacent code, and it is young. There are no guarantees beyond
+  the unit tests in this repository and the packet captures described here.
+- Treat what you read as *reviewed by a human, but not proven by time*. Read the
+  source before putting it in front of anything that matters. It is small on
+  purpose: two wrappers, one shared helper, and their tests.
+- Expect the maintainer to verify changes by reading the code rather than by
+  trusting whichever model produced it.
+- Bug reports, and corrections to the reasoning in this document, are welcome.
 
 ## License
 
