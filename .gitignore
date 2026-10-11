@@ -1,0 +1,6 @@
+# xcaddy build output
+/caddy
+/caddy.exe
+
+# Go test binaries
+*.test
